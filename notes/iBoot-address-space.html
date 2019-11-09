@@ -1,0 +1,224 @@
+<html>
+    <head>
+        <meta http-equiv="Content-Type" content="text/html;charset=UTF-8"> 
+        <title>iBoot address space</title>
+        <style>
+            body {
+                color: black;
+                background: white;
+            }
+            div.note {
+                font-family: monospace;
+                white-space: pre-line;
+                margin-left: auto;
+                margin-right: auto;
+                width: 43em;
+                margin-top: 11%;
+                margin-bottom: 11%;
+            }
+            div.meta {
+                font-family: monospace;
+                font-style: italic;
+                white-space: pre-line;
+                margin-left: auto;
+                margin-right: auto;
+                width: 43em;
+            }
+            div.footer {
+                font-family: monospace;
+                font-weight: bold;
+                white-space: pre-line;
+                margin-left: auto;
+                margin-right: auto;
+            }
+
+        </style>
+    </head>
+
+    <body>
+        <div class = "note">
+
+<h1>iBoot address space</h1>
+
+This Research Note documents a generalized perspective on Apple devices' bootchain memory layout  across all stages of the boot process, and specifically relevant to SecuROM and iBoot. As a case study, a detailed memory map of iPhone 5 during boot is presented.
+
+
+<h2>Introduction</h2>
+In the past few years I studied zero-day vulnerability discovery and exploit development across various classes of software systems: browsers, operating system kernels, hypervisors, and most recently, various firmwares, TrustZone and Secure Boot<a href="http://github.com/badd1e/Disclosures">.</a> As a result of that systematical study, I recognized that a clear mental model of a system's memory space is the cornerstone of professional exploit development, just as a clear mental model of a system's input consuption is the cornerstone of vulnerability discovery. These are the fundamental elements of research intelligence, both as a reference and as a first step in a systematical study of a new system.
+
+The security community has always paid much attention to systematical research and documenting of various heap internals, as heap is the central playground of both userland and kernel code, where majority of memory corruptions occur. For bootchains and firmware in general, however, heap is only one part of the puzzle, due in part to the compact nature of these systems, where a buffer overflow can potentially span multiple functional memory areas beyond the heap and the stack. In that context we want to learn: how the system's entire memory space is segregated; where exactly are the boundaries of various memory regions and their purposes; memory access permissions; in general, what we should avoid stomping on, and what may be useful for a pivoting overwrite.
+
+Understanding of the bootchain memory space of Apple's devices is crucial for prototyping security vulnerabilities that break the Secure Boot procedure, which Apple explicitly motivates with their Security Bounty <a href="https://www.apple.com/business/docs/site/iOS_Security_Guide.pdf">[1]</a>.  Within a larger perspective of iOS security research, such knowledge stands at the foundation of developing persistent and tethered jailbreaks.
+
+This is mostly a theoretical study, based on Apple's source codes available in the public domain, analysis of various bootchain-level exploits, and reverse engineering.
+
+
+<h2>Background</h2>
+All devices produced by Apple - iPhones, iPads, iPods, and Apple TVs - rely on a secure boot mechanism based on a cryptographic chain of trust, which ensures integrity of all components of the boot chain and the operating system. For more information about this mechanism refer to the official iOS Security Guide <a href="https://www.apple.com/business/docs/site/iOS_Security_Guide.pdf">[1]</a>. 
+
+Despite apparent complexity of the boot chain, especially on older iPhones, it's generally simple: 
+1. the root of trust: SecureROM - which is hardware-based code with Apple's cryptographic keys - acquires, cryptographically verifies, and starts iBoot;
+2. iBoot acquires, cryptographically verifies, and boots the iOS kernel;
+3. iOS kernel loads, cryptographically verifies, and contains apps.
+
+SecuROM and iBoot are the two most important stages of the boot process, reachable via USB from DFU mode and Recovery Mode, respectively. Other components of the boot chain (LLB, iBEC, iBSS) may be omitted for the purposes of a generalized study, as they don't seem to have much unique attack surface, whilst being hard to reach with a bug. Also, there is a tendency for unification of the boot chain <a href="https://www.apple.com/business/docs/site/iOS_Security_Guide.pdf">[1]</a>.
+
+One important thing to note about the bootchain components, and why I am filing them under the same research note: they share a lot of common code, and in particularly the low-level service primitives which are responsible for fundamental operations at all stages of boot, such as heap management and task management. 
+
+Each component of the boot chain sits in its own part of the memory space. Each receives its own personal memory regions for operating and book-keeping purposes. From the perspective of the running code, SecureROM and iBoot each see a different memory layout. As a result, the same vulnerability which impacts both SecuROM and iBoot would have entirely different security implications (beyond patching) and exploit development techniques. 
+
+Likewise, the global memory layout differs significantly, not only across device models, but also with respect to model modifications. Hardware properties of the same model - such as the size of the screen or memory capacity - impact the placement and size of crucial memory regions. 
+
+Nevertheless, let's try to observe the fundamental principles in bootchain memory organization: overall structure of the memory space, common types of memory regions, and general tendencies in their placement which are invariant to boot stages and hardware.
+
+
+<h2>Memory overview</h2>
+iPhone's physical memory view is backed by several distinct memory banks: notably, DRAM, as seen in device specifications and teardown blogs; read-only flash storage which contains SecuROM; and probably a faster memory chip, used almost exclusively by the 1st stage bootloader (SecuROM). 
+
+During the boot procedure each subsequent component of the bootchain claims its predefined space in  memory in a process similar to unrolling a carpet. ROM is always mapped at the same offset per SoC, and relocated to the high memory for booting. iBoot is loaded in the lower half of the memory space, that gets eventually re-used by the kernel. The memory at offset zero is always reserved for the boot trampoline.
+
+Compare a top-level memory map on iPhone 5 (32-bit A6) and iPhone 7+ (64-bit A11, probably up to iPhone X):
+
+iPhone 5 (A6 S5L8950X):
+
+0x00000000: ARM reset vector,
+  relocated bootstrap code
+0x10000000: SecuROM playground
+  size: 0x00080000
+0x3F000000: ROM mapping
+  size: 0x00010000
+0x80000000: iBoot & kernel
+  size: 0x40000000
+0xBFFFFFFF:
+
+iPhone 7+ (A10 T8010):
+
+0x0'00000000: ARM reset vector,
+  relocated bootstrap code
+0x1'00000000: ROM mapping
+  size: 0x0'02000000
+0x1'80000000: SecureROM playground
+  size: 0x0'00200000
+0x8'00000000: iBoot & kernel
+  size: varies
+0xX
+
+As seen from the comparison, not only the offsets are different, but the ROM mapping is placed differently. 
+
+
+<h2>Memory regions</h2>
+From the perspective of vulnerability research and exploit development, we are mainly interested in specific types of memory regions, containing the code's runtime structures that may be corrupted and leveraged for a pivot: heaps, stacks, data segment, and whatever memory holds the program's inputs. We are also interested in the code section, that may be reused for code execution in a ROP chain (if it's read-only), or modified (if its writeable). At deeper stages of the research process, hardware-based vulnerability prototyping asks for I/O register mappings and MMU configs. 
+
+Code. All executable components of the bootchain are loaded at predefined memory addresses, after being copied there from their respective storage locations. SecuROM code is moved from the ROM origin to high memory and executed from there. iBoot code address varies per device model.
+
+Data. This is where globally defined variables and arrays live. Notably, data section holds the roots of the heap. Data section of each bootchain component starts immediately after the code section, except for SecuROM which uses a statically defined memory address to which the data section is moved by the bootstrap code. Data section is relatively compact, and any overflow in it will spill into the next memory region, which is the heap.
+
+Heaps. Main heap is located immediately after the data section. 2nd stage and later bootloaders (ie. everything past SecuROM) get an extra heap, which is located around the special memory used for bootstrapping.
+
+Stacks. There are system stacks and task stacks. System stacks are reserved for the primordial task, interrupt management and exception management. These are located at a predefined address at the bottom of the memory region used by each bootchain component. Task stacks are allocated and freed on demand from the heap.
+
+A special region of memory is used to receive and contain next stage binary images before they are verified. This region is directly writeable via USB DFU or Recovery Mode. It is located at a fixed address and may be adjoined with either data section (in SecuROM) or with the extra heap (in iBoot). 
+
+I/O space. Located at a fixed address somewhere between SecuROM space and iBoot space, and far away from both.
+
+MMU page tables. This is where the MMU configuration is stored, and can't be touched. Stored at a predefined address near the system stacks. 
+
+In addition, newer A-SoCs have special memory regions required by new hardware, such as PCI register mappings and configuration space (A7+) and SEP TZ0 on devices with Secure Enclave.  
+
+
+<h2>Security mitigations</h2>
+Apple's bootchain is devoid of ASLR, at least upto iPhone X.
+
+Memory access permissions segregation (W^X) was added in A7 (iPhone 5S). On older models such as iPhone 5 everything is possible.
+
+In general, it appears that many security-relevant hardware and firmware improvements were introduced with A7, which is also the first 64-bit A-SoC.
+
+Internal mitigations of heaps and stacks are out of scope of this note. 
+
+
+<h2>Case study: iPhone 5 address space</h2>
+Let's expand the high-level memory view of iPhone 5 presented above to a detailed view which includes each bootloader's private memory view.
+
+<pre>0x00000000: ARM reset vector,
+    relocated SecuROM code
+
+0x10000000: SecureROM playground
+    size: 0x00080000
+    ...
+    0x10000000: Reserved for bootstrap
+    size: 0x00060000
+    0x10060000: Data 
+    size: 0x00003000
+    0x10063000: Heap
+    size: 0x00016000
+    0x10079000: System stacks
+    size: 0x00003000
+    0x1007c000: MMU page tables 
+    size: 0x00004000
+0x1007FFFF: End of SecureROM playground
+    ...
+
+0x30000000: I/O register mappings
+
+0x3F000000: ROM mapping
+    size: 0x00010000
+    ...
+
+0x80000000: Main memory: iBoot and kernel
+    size: 0x40000000
+
+    0x80000000: Reserved for bootstrap
+        size: 0x10000000
+
+    0x--------: Heap extra (varies, ~0x90000000)
+
+    0xBFF00000: iBoot code
+        size: 0xFC000
+
+    0x--------: Data 
+    0x--------: Heap
+
+    0xBFFF7000: System stacks
+
+    0xBFFF8000: MMU page tables
+
+0xBFFFFFFF: End of main memory</pre>
+
+Note that it's still a simplified map, with the LLB space omitted for the same reasons as stated above, and many functional memory regions never mentioned which are less relevant to the problem of vulnerability research. 
+
+This is a researcher's view, mapped outside of the time domain. In reality only one part of this map is active and relevant at any given moment. When SecuROM runs, iBoot is not loaded yet, its heaps and stacks are not initialized. When iBoot runs, SecuROM is inactive, its heaps and stacks are not relevant. After the kernel boots, iBoot is in the past and may be destroyed by the kernel's operation.
+
+
+<h2>Recommendations</h2>
+Apple could greatly enhance the security of its bootchain by introducing some entropy into the placement of various memory regions, also known as the Address Space Randomization. ASLR is a well established security mitigation across all types of software systems, that prevents certain types of exploits completely, while increasing the development costs of others by a factor of 2x-10x by forcing the developer to discover or craft a memory disclosure primitive in addition to the code execution vulnerability. Whilst the iOS kernel has been equipped with ASLR for a while, the bootchain is lagging behind. 
+
+As a case study: ASLR probably would not have prevented the <a href="https://github.com/axi0mX/ipwndfu/blob/master/checkm8.py">checkm8 exploit</a>, because it relies on a very powerful heap corruption primitive that can in theory be leveraged both for arbitrary code execution and a memory disclosure. However, ASLR would require the developer to groom a significantly more precise heap layout whilst relying on some additional SecuROM code functionality to inform the exploit about the memory offsets that it needs for operation - at the very least, that would minimize the number of parties in posession of the exploit.
+
+Secure placement of memory regions. Besides ASLR, simple disjoining of memory regions by a large margin or a guard page would block a class of exploits based on cross-boundary overflows from data to heap, from heap to system stacks, and so on. 
+
+Task management design refactoring. Currently both SecuROM and iBoot's task stacks are allocated on the heap at runtime, which introduces unnecessary simplification to exploit development. An arbitrary heap corruption vulnerability in bootchain can be turned into a stack pivot for shell code execution with near-zero effort. Compare it with a more traditional implementation found on majority of userland and kernel systems, where stacks are allocated in a special region far away from the heap, maybe once per runtime, and can only be exploited with a stack-based vulnerability, but rarely with a heap corruption vulnerability.
+
+These recommendations are based on my best knowledge of Apple devices' bootchain implementation up to iPhone X, and good will. Heap and stack internals hardening considerations are out of scope. 
+
+<h2>References</h2>
+1. iOS Security Guide 
+   https://www.apple.com/business/docs/site/iOS_Security_Guide.pdf 
+2. Apple Open Source
+   https://opensource.apple.com/
+
+Todo: hex dumps
+        </div>
+
+        <div class = "meta">
+Created and published by Alisa Esage Шевченко on 10 November 2019. 
+Last-edited: 10 November 2019.
+Original URL: http://re.alisa.sh/notes/iBoot-address-space.html
+Author's contacts: <a href="http://twitter.com/alisaesage">twitter</a>, <a href="http://github.com/badd1e">github</a>
+        </div>
+
+        <div class = "footer">
+Copying and redistribution of this web page is permitted for non-commercial purposes only, as long as the text is kept intact and contains a reference to the original URL and the author's name. Commercial usage of this web page without the author's explicit written permission is prohibited.
+        </div>
+
+    </body>
+</html>
