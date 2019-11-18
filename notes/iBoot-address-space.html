@@ -8,7 +8,8 @@
                 background: white;
             }
             div.note {
-                font-family: monospace;
+                font-family: 'Lucida Console', monospace;
+                font-size: 13;
                 white-space: pre-line;
                 margin-left: auto;
                 margin-right: auto;
@@ -17,7 +18,8 @@
                 margin-bottom: 11%;
             }
             div.meta {
-                font-family: monospace;
+                font-family: 'Lucida Console', monospace;
+                font-size: 13;
                 font-style: italic;
                 white-space: pre-line;
                 margin-left: auto;
@@ -25,7 +27,8 @@
                 width: 43em;
             }
             div.footer {
-                font-family: monospace;
+                font-family: 'Lucida Console', monospace;
+                font-size: 13;
                 font-weight: bold;
                 white-space: pre-line;
                 margin-left: auto;
@@ -75,11 +78,11 @@ Nevertheless, let's try to observe the fundamental principles in bootchain memor
 <h2>Memory overview</h2>
 iPhone's physical memory view is backed by several distinct memory banks: notably, DRAM, as seen in device specifications and teardown blogs; read-only flash storage which contains SecuROM; and probably a faster memory chip, used almost exclusively by the 1st stage bootloader (SecuROM). 
 
-During the boot procedure each subsequent component of the bootchain claims its predefined space in  memory in a process similar to unrolling a carpet. ROM is always mapped at the same offset per SoC, and relocated to the high memory for booting. iBoot is loaded in the lower half of the memory space, that gets eventually re-used by the kernel. The memory at offset zero is always reserved for the boot trampoline.
+During the boot procedure each subsequent component of the bootchain claims its predefined space in  memory in a process similar to unrolling a carpet. ROM is always mapped at the same offset per SoC, and relocated to the high memory for booting on 32-bit devices. iBoot is loaded in the lower half of the memory space, that gets eventually re-used by the kernel. The memory at offset zero is always reserved for the boot trampoline.
 
 Compare a top-level memory map on iPhone 5 (32-bit A6) and iPhone 7+ (64-bit A11, probably up to iPhone X):
 
-iPhone 5 (A6 S5L8950X):
+iPhone 5 (A6 S5L8950X - 32-bit):
 
 0x00000000: ARM reset vector,
   relocated bootstrap code
@@ -91,10 +94,9 @@ iPhone 5 (A6 S5L8950X):
   size: 0x40000000
 0xBFFFFFFF:
 
-iPhone 7+ (A10 T8010):
+iPhone 7+ (A10 T8010 - 64-bit):
 
-0x0'00000000: ARM reset vector,
-  relocated bootstrap code
+0x0'00000000: reserved
 0x1'00000000: ROM mapping
   size: 0x0'02000000
 0x1'80000000: SecureROM playground
@@ -202,18 +204,22 @@ These recommendations are based on my best knowledge of Apple devices' bootchain
 
 <h2>References</h2>
 1. iOS Security Guide 
-   https://www.apple.com/business/docs/site/iOS_Security_Guide.pdf 
+   <a href="https://www.apple.com/business/docs/site/iOS_Security_Guide.pdf">https://www.apple.com/business/docs/site/iOS_Security_Guide.pdf</a>
 2. Apple Open Source
-   https://opensource.apple.com/
+   <a href="https://opensource.apple.com/">https://opensource.apple.com/</a>
+3. Principles of ARM® Memory Maps White Paper 
+   <a href="http://infocenter.arm.com/help/topic/com.arm.doc.den0001c/DEN0001C_principles_of_arm_memory_maps.pdf">http://infocenter.arm.com/help/topic/com.arm.doc.den0001c/DEN0001C_principles_of_arm_memory_maps.pdf</a>
 
 Todo: hex dumps
         </div>
 
         <div class = "meta">
 Created and published by Alisa Esage Шевченко on 10 November 2019. 
-Last-edited: 10 November 2019.
+Last-edited: 18 November 2019.
 Original URL: http://re.alisa.sh/notes/iBoot-address-space.html
-Author's contacts: <a href="http://twitter.com/alisaesage">twitter</a>, <a href="http://github.com/badd1e">github</a>
+Acknowledgements: <a href="http://twitter.com/s1guza">s1guza</a> for volunteering to proof-read this article
+Author's contacts: <a href="mailto:contact@alisa.sh">e-mail</a>, <a href="http://twitter.com/alisaesage">twitter</a>, <a href="http://github.com/badd1e">github</a>
+Next steps: join <a href="https://twitter.com/alisaesage/status/1193936682971586561">iBootcamp</a> and learn iOS security with me.
         </div>
 
         <div class = "footer">
