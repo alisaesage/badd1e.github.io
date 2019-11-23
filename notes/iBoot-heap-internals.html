@@ -1,0 +1,174 @@
+<html>
+    <head>
+        <meta http-equiv="Content-Type" content="text/html;charset=UTF-8"> 
+        <title>iBoot heap internals</title>
+        <style>
+            body {
+                color: black;
+                background: white;
+            }
+            div.note {
+                font-family: 'Lucida Console', monospace;
+                font-size: 13;
+                white-space: pre-line;
+                margin-left: auto;
+                margin-right: auto;
+                width: 43em;
+                margin-top: 11%;
+                margin-bottom: 11%;
+            }
+            div.meta {
+                font-family: 'Lucida Console', monospace;
+                font-size: 13;
+                font-style: italic;
+                white-space: pre-line;
+                margin-left: auto;
+                margin-right: auto;
+                width: 43em;
+            }
+            div.sticker {
+                background: yellow;
+                font-family: 'Lucida Console', monospace;
+                font-size: 13;
+                white-space: pre-line;
+                margin-left: auto;
+                margin-right: auto;
+                width: 43em;
+            }
+            div.footer {
+                font-family: 'Lucida Console', monospace;
+                font-size: 13;
+                font-weight: bold;
+                white-space: pre-line;
+                margin-left: auto;
+                margin-right: auto;
+            }
+
+        </style>
+    </head>
+
+    <body>
+        <div class = "note">
+
+<h1>iBoot heap internals</h1>
+This research note provides a basic technical outline of the Apple bootchain's heap internals, key algorithms, and security mitigations. This heap implementation is commonly at work at all stages of the boot procedure of iPhones and other Apple devices, and particularly by SecuROM and iBoot. 
+
+SecuROM (Apple's 1st stage bootloader) and iBoot (the 2nd stage bootloader) are the two most important targets of jailbreaking efforts, as they form the basic tier of the cryptographic verification foundation on which Apple's entire Secure Boot procedure stands. In general, understanding of the bootchain's heap internals is essential to exploitation of heap-based memory corruption vulnerabilities in any of the boot loaders.
+
+Aside from jailbreaking, the Apple's bootchain heap makes a perfect specimen for a generalized study of heap implementations, because it's classical, simple and compact, while still maintaining all the commonly recommended security mitigation techniques. 
+
+General tendencies of heap placement within the device's address space were discussed in my previous researh note: <a href="http://re.alisa.sh/notes/iBoot-address-space.html">iBoot address space</a>. 
+
+
+<h2>Overview</h2>
+Apple's bootchain uses a classical heap implementation based on free lists, enhanced with immediate coalescing and security mitigations. It is very simple compared to various well-researched kernel and userland heap implementations, such as the Low Fragmentation Heap in Microsoft Windows, or Linux's glibc. 
+
+Each stage of the bootchain receives its own heap. In practice there may be 1-2 heaps backing runtime memory requirements of the booting code, depending on the platfrom and the boot stage. 
+
+Bootchain's heap implementation exposes a standard set of memory management APIs: malloc, calloc, realloc, memalign, free, and memcpy / memset. 
+
+
+<h2>Initialization</h2>
+Heap is initialized in each stage's system initialization routine, immediately after various bootstrapping tasks are completed, such as code and data relocation. Heap size, number of heaps and their placement are device-specific, submodel-specific and stage-specific, although some general tendencies may be observed. <a href="http://re.alisa.sh/notes/iBoot-address-space.html">[1]</a>
+
+The initialization routine receives a contiguous piece of physical memory which is designated for the heap, and adds it to the largest bin's free-list. Heap roots - initial heap handles and bin pointers from which free lists are walked - are maintained in the data section.
+
+
+<h2>Allocations and frees</h2>
+Bootchain's heap allocator is based on the classical <a href="https://www.memorymanagement.org/mmref/alloc.html#first-fit">first-fit free-list algorithm</a> with 30 bins and immediate <a href="https://www.memorymanagement.org/glossary/c.html#term-coalesce">coalescing</a>. New heap chunks requested by malloc() are either allocated contiguously from the slab (represented with some larger free chunk than requested), or re-used from the free-list. Only the free-list based allocator is used; there are no dedicated fast-bins or a large-chunk allocator that are commonly found in more advanced heap implementations. 
+
+On allocation, the free list of the appropriate (by size) bin is iterated, and the first free chunk that accomodates the requested size is assigned to the allocation. Unneeded free space in that chunk is chopped off and returned to the appropriate bin.
+
+A freed heap chunk is added at the top of the respective bin. If the adjacent chunk is free, the two chunks are immediately coalesced and moved to the respective bin's free-list. 
+
+
+<h2>Free-lists and bins</h2>
+Free heap chunks are sorted by size and stored into 30 bins, numbered 2 through 31. Each bin is represented with a global variable in the data section, that holds the topmost item of the free-list for that bin. 
+
+A free-list is a simple doubly-linked list. Free-list's previous and next pointers are appended to each heap chunk's metadata header upon a free() operation. Free-lists are walked on each allocation request, starting from the top of the bin which is appropriate to the requested size of the allocation. 
+
+Heap chunk sizes are measured in and rounded to 64-byte units (2^6), including a 64-byte metadata header and reserved space for freelist pointers. For example, given the minimum requested allocation size of 1 byte, in practice will result in 128 bytes being allocated from the heap. Bins sort the chunks by powers of 2. 
+
+Bins: 30, 2 through 31
+  0 => 0-63 (2^6-1) - never happens
+  1 => 64-127 (2^7-1) - never happens
+  2 => 128-255 byte chunks
+  3 => 256-511 byte chunks
+  4 => 512-1023 byte chunks
+... etc., up to 31.
+
+Note: Bins 0 and 1 exist, but they are never used in practice due to allocation size constraints.
+
+
+<h2>Metadata</h2>
+Each heap chunk has a metadata header prepended, which has a size of 64 bytes, both on 32-bit and 64-bit systems. The header contains a 64-bit checksum, followed by a standard set of information fields: size and busy/free status of the current and the previous chunk.
+
+Free chunks have an additional 2*size_t metadata block appended to the header, that holds the pointers to the previous and the next free chunk in the bin, used during walking the free-lists. 
+
+
+<h2>Security mitigations</h2>
+Bootchain's heap implementation employs several well-known security mitigations in order to detect random heap corruptions and harden exploit development for heap-based vulnerabilities.
+
+1. Heap uses a 128-bit random cookie which is stored in the data section. The cookie is used for initial randomization of the heap placement and verification of heap metadata checksums. 
+
+On older devices (A7 and earlier) SecuROM and LLB use a statically initialized heap cookie: [ <a href="https://xkcd.com/221/">0x64636b783132322f</a>, 0xa7fa3a2e367917fc ]. 
+
+Note: the cookie is placed at the top of the data section, as the heap is initialized early. It will not be corrupted by a data-to-heap overflow.  
+
+2. Initial heap placement may be randomized with 24 bits of entropy, resulting in a random shift of the heap arena by at most 0x3ffc0 bytes against the data section or wherever else it is placed. In LLB and SecuROM the shift is not randomized on older devices (up to and inclusive A7). 
+
+3. There is no runtime randomization in the allocation algorithm. All heap chunk addresses returned by malloc() are deterministic with respect to the heap base, as they are popped from the appropriate free-list in FIFO manner. 
+
+4. Metadata checksum verification. To prevent heap chunk metadata corruption due to a heap overflow, a chunk's checksum is verified on each heap operation, and will cause an immediate panic if the checksum was corrupted. In addition, an extended heap verification occurs prior to executing the next stage bootloader. 
+
+The checksum is calculated from the chunk's metadata based on the <a href="https://en.wikipedia.org/wiki/SipHash">SipHash</a> algorithm, using the heap cookie as a pseudo-random secret key. 
+
+Due to the heap cookie being deterministic on A7 and prior SoCs' LLB and SecuROM, the checksum is deterministic and heap overflow attacks are trivial in that particular case. On more recent devices, cross-chunk overflow attacks may still be possible, provided that the vulnerability is pivoted to the shellcode before any heap APIs are called. Since heap usage is not very high in the bootchain, this is realistic.
+
+5. Padding verification. Extra bytes of the chunk beyond the user's requested size are padded with a simple rotating pattern, generated by a function of the user's requested size. This mitigation helps to detect casual heap corruptions, but has near-zero impact on exploit development complexity, since the attacker commonly controls the user's size of the overflowing chunk. 
+
+6. Safe unlinking is in place. Free-list pointers are cross-checked against the previous and the next chunk on each free-list operation. A chunk's size is checked against the previous chunk's next_chunk size.
+
+7. Double-frees are detected by verifying the current chunk's free bit in the metadata header.
+
+8. Freed chunks are zeroed. Thus a typical use-after-free vulnerability will manifest itself as a null-pointer dereference upon a random crash. This has no impact on exploit development. 
+
+9. All new allocations are zero-initialized. This closes much of the opportunity for memory disclosure attacks via an uninitialized heap variable vulnerability. 
+
+10. Zero-sized allocations are not permitted, and will result in a panic.
+
+11. Negatively sized allocations due to an integer underflow/overflow are possible. They are less likely on 64-bit devices, since malloc's size argument would be 64-bit in such case.   
+
+In summary, these mitigations ensure a basic level of heap protection on recent devices. Exploitation of typical heap corruption vulnerabilities such as data-to-heap and cross-chunk overflows is still possible and realistic in many cases. The strongest mitigations in place are checksum verification and safe unlinking, that would make exploitation of cross-chunk overflows on recent devices non-trivial. This is especially relevant to iBoot, which uses the heap more actively than SecuROM, thus making it more likely that a corrupted heap metadata will be detected before the shellcode had a chance to execute. 
+
+
+<h2>References</h2>
+1. "iBoot address space", Alisa Esage
+   <a href="http://re.alisa.sh/notes/iBoot-address-space.html">http://re.alisa.sh/notes/iBoot-address-space.html</a>
+2. iOS Security Guide 
+   <a href="https://www.apple.com/business/docs/site/iOS_Security_Guide.pdf">https://www.apple.com/business/docs/site/iOS_Security_Guide.pdf</a>
+3. Memory Management Reference
+   <a href="https://www.memorymanagement.org/index.html">https://www.memorymanagement.org/index.html</a>.
+ 
+  
+<h2>Annex A</h2>
+This research note is a teaser into advanced stages of <a href="https://twitter.com/alisaesage/status/1193936682971586561">iBootcamp</a>, an online training course on iOS internals and vulnerability research for beginners that I am creating. 
+
+The only live session of Stage 0 will take place on 12-21 December 2019. <a href="mailto:iboot@alisa.sh">You are welcome</a>. ⭐️
+
+    </div>
+
+
+        <div class = "meta">
+Created and published by Alisa Esage Шевченко on 23 November 2019. 
+Last edited: 23 November 2019.
+Original URL: http://re.alisa.sh/notes/iBoot-heap-internals.html.
+Author's contacts: <a href="mailto:contact@alisa.sh">e-mail</a>, <a href="http://twitter.com/alisaesage">twitter</a>, <a href="http://github.com/badd1e">github</a>.
+        </div>
+
+        <div class = "footer">
+Copying and redistribution of this Research Note is permitted for non-commercial purposes only, as long as the text is kept intact, and contains a reference to the original URL, the author's contacts, and the present copyright notice. Commercial usage of this Research Note without the author's explicit written permission is prohibited.
+        </div>
+
+    </body>
+</html>
