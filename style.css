@@ -1,0 +1,59 @@
+body {
+    color: black;
+    background: white;
+}
+div.contents {
+    font-family: 'Monaco', monospace;
+    font-size: 14;
+    white-space: pre;
+    margin-left: auto;
+    margin-right: auto;
+    width: 43em;
+    margin-top: 21;
+    margin-bottom: 21;
+}            
+div.note {
+    font-family: 'Monaco', monospace;
+    font-size: 14;
+    white-space: pre-line;
+    margin-left: auto;
+    margin-right: auto;
+    width: 43em;
+    margin-top: 11%;
+    margin-bottom: 11%;
+}
+div.meta {
+    font-family: 'Monaco', monospace;
+    font-size: 14;
+    font-style: italic;
+    white-space: pre-line;
+    margin-left: auto;
+    margin-right: auto;
+    width: 43em;
+    margin-bottom: 30;
+}
+div.footer {
+    font-family: 'Times New Roman';
+    font-size: 11;
+    font-weight: bold;
+    white-space: pre-line;
+    margin-left: auto;
+    margin-right: auto;
+}
+div.code {
+    font-family: 'Courier New', monospace;
+    font-size: 13;
+    white-space: pre;
+    margin-left: auto;
+    margin-right: auto;
+    width: 43em;
+}            
+div.index {
+    font-family: 'Monaco', monospace;
+    font-size: 14;
+    white-space: pre-line;
+    margin-left: auto;
+    margin-right: auto;
+    width: 300px;
+    text-align: center;
+}

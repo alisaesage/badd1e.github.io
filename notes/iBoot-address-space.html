@@ -1,49 +1,8 @@
 <html>
     <head>
-      <!-- Global site tag (gtag.js) - Google Analytics -->
-    <script async src="https://www.googletagmanager.com/gtag/js?id=UA-27750166-2"></script>
-    <script>
-      window.dataLayer = window.dataLayer || [];
-      function gtag(){dataLayer.push(arguments);}
-      gtag('js', new Date());
-
-      gtag('config', 'UA-27750166-2');
-    </script>
         <meta http-equiv="Content-Type" content="text/html;charset=UTF-8"> 
         <title>iBoot address space</title>
-        <style>
-            body {
-                color: black;
-                background: white;
-            }
-            div.note {
-                font-family: 'Lucida Console', monospace;
-                font-size: 13;
-                white-space: pre-line;
-                margin-left: auto;
-                margin-right: auto;
-                width: 43em;
-                margin-top: 11%;
-                margin-bottom: 11%;
-            }
-            div.meta {
-                font-family: 'Lucida Console', monospace;
-                font-size: 13;
-                font-style: italic;
-                white-space: pre-line;
-                margin-left: auto;
-                margin-right: auto;
-                width: 43em;
-            }
-            div.footer {
-                font-family: 'Lucida Console', monospace;
-                font-size: 13;
-                font-weight: bold;
-                white-space: pre-line;
-                margin-left: auto;
-                margin-right: auto;
-            }
-
+        <link rel="stylesheet" href="../style.css">
         </style>
     </head>
 
@@ -92,7 +51,7 @@ During the boot procedure each subsequent component of the bootchain claims its 
 Compare a top-level memory map on iPhone 5 (32-bit A6) and iPhone 7+ (64-bit A11, probably up to iPhone X):
 
 iPhone 5 (A6 S5L8950X - 32-bit):
-
+<div class = "code">
 0x00000000: ARM reset vector,
   relocated bootstrap code
 0x10000000: SecuROM playground
@@ -102,9 +61,9 @@ iPhone 5 (A6 S5L8950X - 32-bit):
 0x80000000: iBoot & kernel
   size: 0x40000000
 0xBFFFFFFF:
-
+</div>
 iPhone 7+ (A10 T8010 - 64-bit):
-
+<div class = "code">
 0x0'00000000: reserved
 0x1'00000000: ROM mapping
   size: 0x0'02000000
@@ -113,7 +72,7 @@ iPhone 7+ (A10 T8010 - 64-bit):
 0x8'00000000: iBoot & kernel
   size: varies
 0xX
-
+</div>
 As seen from the comparison, not only the offsets are different, but the ROM mapping is placed differently. 
 
 
@@ -149,8 +108,8 @@ Internal mitigations of heaps and stacks are out of scope of this note.
 
 <h2>Case study: iPhone 5 address space</h2>
 Let's expand the high-level memory view of iPhone 5 presented above to a detailed view which includes each bootloader's private memory view.
-
-<pre>0x00000000: ARM reset vector,
+<div class = "code">  
+0x00000000: ARM reset vector,
     relocated SecuROM code
 
 0x10000000: SecureROM playground
@@ -193,7 +152,7 @@ Let's expand the high-level memory view of iPhone 5 presented above to a detaile
 
     0xBFFF8000: MMU page tables
 
-0xBFFFFFFF: End of main memory</pre>
+0xBFFFFFFF: End of main memory</div>
 
 Note that it's still a simplified map, with the LLB space omitted for the same reasons as stated above, and many functional memory regions never mentioned which are less relevant to the problem of vulnerability research. 
 
