@@ -1,0 +1,543 @@
+<html>
+    <head>
+        <meta http-equiv="Content-Type" content="text/html;charset=UTF-8"> 
+        <title>Hyper-V LIS</title>
+        <link rel="stylesheet" href="../style.css">
+    </head>
+
+    <body>
+        <div class = "note">
+
+<h1>Hyper-V LIS</h1>    
+This research note documents some core internals of Microsoft Hyper-V through the implementation perspective of the official Hyper-V paravirtualization drivers package for Linux virtual machines: the LIS.
+<div class="contents">
+    <a href="#introduction">Introduction</a>
+    <a href="#background">Background</a>
+    <a href="#implementation">LIS Implementation</a>
+      <a href="#core">LIS Core</a>
+      <a href="#hypercalls">LIS Hypercalls</a>
+    <a href="#conclusions">Conclusions</a>
+    <a href="#references">References</a>
+</div>
+<a name="introduction"><h2>Introduction</h2></a>
+This text has been moved out from the swell draft of my upcoming article about <a href="https://github.com/badd1e/Disclosures/tree/master/CVE-2019-0717_Hyper-V">Hyper-V CVE-2018-0717</a> - a memory corruption bug in Virtual Network Switch, a Hyper-V kernel component, that I found some time ago - because I realized that the set of technologies required to understand the bug is insanely extensive and doesn't fit in a single article. Because of that, the high-level context about Hyper-V architecture and certain conceptual links are excluded from this note, and will be covered later. <a href="https://docs.microsoft.com/en-us/virtualization/hyper-v-on-windows/reference/hyper-v-architecture">[HVARCH]</a>
+
+In general, Hyper-V design and implementation are quite different from all other hypervisors, though it borrows a lot from Xen, both on the conceptual design level (dom0/domU, enlightenments, paravirtualizations, privilege separation model, etc.) and the technical implementation level (the hypercall page, hypercalls format, etc.). On the other hand, Hyper-V is a near complete opposite of VMWare ESXi in practice, though the two products would be casually mentioned together and compared as Type 1 hypervisors, with the same expectations for system architecture and deployment scenarios. 
+
+Deep technical visibility into undocumented Hyper-V internals may be obtained by either reverse-engineering the Hyper-V Windows modules and API, or by inspecting and instrumenting the Linux-based implementation of the same functionality via LIS. Hyper-V modules on different OSes are assumed to be largely equivalent with respect to the underlying Hyper-V protocols, since the hypervisor internals are the same for any guest OS. 
+
+Code analysis in this note is based on LIS-next commit <a href="https://github.com/LIS/lis-next/tree/5d19776e53ef797b596f9a01511866c1f4890d01">5d19776e53ef797b596f9a01511866c1f4890d01</a> (February 2020).
+
+
+<a name="background"><h2>Background</h2></a>
+All modern virtualization systems rely on specialized guest OS modules for rich usability experience, inter-VM and hypervisor communications, and special services. These are usually refered to as "Guest Additions". LIS stands for "Linux Integration Services" - Hyper-V's guest additions for Linux. Specifically, LIS modules implement Hyper-V-specific paravirtualization functionality for enlightened (virtualization-aware) networking, storage, PCI pass-through, <a href="https://en.wikipedia.org/wiki/Human_interface_device">HID</a>, keyboard, and memory balooning on Linux virtual machines.
+
+One common myth about Guest Additions in general is that they are opt-in and unnecessary. While that was true some decades ago, today's virtualization use cases and deployment scenarios dictate high demands for networking speed (meaning RDMA), graphics quality (requires access to the GPU hardware), and integration capabilities (shared folders, etc.) - that in turn translates into the technical requirement of Guest Additions which are privileged, extensive, and seamless, and enable safe and effective usage of real hardware versus emulated devices. 
+
+In practice, all major hypervisors' Guest Additions are already baked into the Linux Kernel, and are loaded automatically when one installs an off-the-shelf modern Ubuntu, for example. Microsoft Windows doesn't have these (yet?), but the underlying hypervisor interfaces are often exposed to the virtual machine's operating system by default, and may be claimed by a custom-written kernel module. 
+
+LIS package is officially distributed from the Microsoft website <a href="https://www.microsoft.com/en-us/download/details.aspx?id=55106">[LIS]</a> and github targeting a few specific Linux-based OSes, such as Red Hat Enterprise. But the "real LIS" which is actively maintained and of the latest version is scattered around the Linux kernel and is compatible with all mainstream Linuses. 
+
+LIS provides specialized Linux kernel drivers for paravirtualized devices and hypervisor-specific services. It works by translating high-level requests to various device subsystems into the Hyper-V-specific protocol, and sending them to the hypervisor via virtual channels. 
+
+
+<a name="implementation"><h2>LIS Implementation</h2></a>
+LIS code is moderately extensive, with a dozen of Linux kernel modules that implement networking, storage, HID and keyboard, memory balooning, PCI pass-through, heartbeat, the VMBUS and the hypercall interface: 
+<div class = "code">
+    // <a href="https://github.com/LIS/lis-next/blob/master/hv-rhel7.x/hv/Makefile">Makefile</a>
+    obj-m   += hv_vmbus.o
+    obj-m   += hv_storvsc.o
+    obj-m   += hv_netvsc.o
+    obj-m   += hv_utils.o
+    obj-m   += hid-hyperv.o
+    obj-m   += hyperv_fb.o
+    obj-m   += hv_balloon.o
+    obj-m   += hyperv-keyboard.o
+    obj-m   += hv_network_direct.o
+    obj-m   += hv_sock.o
+    obj-m   += pci-hyperv.o
+    obj-m   += uio_hv_generic.o
+</div>
+Note: I am quoting LIS code for RHEL7, which is sligtly different from the upstream kernel implementation. 
+
+The main function of LIS LKMs is to translate Linux kernel protocols for the respective device functionality into the Hyper-V language, and send it over the VMBUS (Virtual Machine Bus) to the hypervisor. The hypervisor forwards that to the root partition, where the device requests are accepted by the host-side implementation of the respective virtualized device. From there, data is translated/sanitized and sent over either to the physical hardware, or to the respective emulated device. 
+
+LIS uses two mechanisms to communicate with the hypervisor: the VMBUS (shared memory) and hypercalls (special CPU instructions that call into the hypervisor, in this case). 
+
+VMBUS is a physical backend of all Hyper-V partitions, represented with a piece of shared memory and managed by specialized kernel and userland modules on both sides of the virtualization boundary. VMBUS is a purely synthetic entity, meaning that it doesn't exist as a (virtual) hardware resource available to the guest OS, such as a PCI space or I/O memory, but only accessible to enlightened (virtualization-aware) guests, and set up via the hypercall interface [see the section: "<a href="#hypercalls">LIS Hypercalls</a>"].
+
+One can visualise LIS architecture as a layered cake. On the top level which borders with consumers sit the kernel modules that implement familiar Linux device models and expose standard device interfaces into the kernel. As device requests flow from the userland and adjacent kernel subsystems into those interfaces, at the point when they would normally be forwarded by the kernel to the physical hardware I/O interfaces, the requests are instead sent over the VMBUS to the root partition for opaque handling on the other side. At the very core of this picture is the hypercall interface. 
+
+Let us skip the high-level implementation details, and look straight into the core of the mechanism that LIS uses to interface with the hypervisor: the public consumer-facing vmbus_*packet*() API family that implements the VMBUS interface - main mechanism for large data transfers, and the low-level API family hv_do_*() that implements the hypercall interface and the Hyper-V IPC. 
+
+
+<a name="core"><h2>LIS Core</h2></a>
+<a href="https://elixir.bootlin.com/linux/latest/source/drivers/hv/channel.c#L747">vmbus_sendpacket()</a> (declared in hyperv.h and defined in channel.c) is the core kernel API function of LIS that implements the guest's interface endpoint to the VMBUS, while abstracting away its low-level implementation details. It is exported to the Linux kernel, and invoked by all LIS modules as part of their paravirtualization functionality when forwarding virtualized device requests to the hypervisor. It is prototyped as follows:
+<div class = "code">
+    // channel.c
+    /**
+    * vmbus_sendpacket() - Send the specified buffer on the given channel
+    * @channel: Pointer to vmbus_channel structure
+    * @buffer: Pointer to the buffer you want to send the data from.
+    * @bufferlen: Maximum size of what the buffer holds.
+    * @requestid: Identifier of the request
+    * @type: Type of packet that is being sent e.g. negotiate, time
+    *	  packet etc.
+    * @flags: 0 or VMBUS_DATA_PACKET_FLAG_COMPLETION_REQUESTED
+    *
+    * Sends data in @buffer directly to Hyper-V via the vmbus.
+    * This will send the data unparsed to Hyper-V.
+    *
+    * Mainly used by Hyper-V drivers.
+    */
+    int vmbus_sendpacket(struct vmbus_channel *channel, void *buffer,
+                u32 bufferlen, u64 requestid,
+                enum vmbus_packet_type type, u32 flags)
+</div>
+Searching for <a href="https://elixir.bootlin.com/linux/latest/ident/vmbus_sendpacket">cross-references to vmbus_sendpacket()</a> reveals some 70+ uses across 19 consumers in LIS for RHEL7. In some modules vmbus_sendpacket() is called directly each time when data must be sent, while in other modules it is wrapped by a subsystem-specific API. May be both: 
+<div class = "code">
+    // netvsc.c: <a href="https://elixir.bootlin.com/linux/latest/source/drivers/net/hyperv/netvsc.c#L805">netsvc_send_pkt()</a> - networking-specific VMBUS interface API
+    static inline int netvsc_send_pkt(
+        struct hv_device *device,
+        struct hv_netvsc_packet *packet,
+        struct netvsc_device *net_device,
+        struct hv_page_buffer *pb,
+        struct sk_buff *skb)
+    {
+        ... skip ...
+        if (packet->page_buf_cnt) {
+            if (packet->cp_partial)
+                pb += packet->rmsg_pgcnt;
+
+            ret = vmbus_sendpacket_pagebuffer(out_channel,
+                            pb, packet->page_buf_cnt,
+                            &nvmsg, sizeof(nvmsg),
+                            req_id);
+        } else {
+            ret = vmbus_sendpacket(out_channel,
+                        &nvmsg, sizeof(nvmsg),
+                        req_id, VM_PKT_DATA_INBAND,
+                        VMBUS_DATA_PACKET_FLAG_COMPLETION_REQUESTED);
+        }
+        ... skip ...
+    }
+
+    // netvsc.c: <a href="https://elixir.bootlin.com/linux/latest/source/drivers/net/hyperv/netvsc.c#L491">negotiate_nvsp_ver()</a> - direct call to negotiate the service version
+    static int negotiate_nvsp_ver(struct hv_device *device,
+                    struct netvsc_device *net_device,
+                    struct nvsp_message *init_packet,
+                    u32 nvsp_ver)
+    {
+        ... skip ...
+        /* Send the init request */
+        ret = vmbus_sendpacket(device->channel, init_packet,
+                    sizeof(struct nvsp_message),
+                    (unsigned long)init_packet,
+                    VM_PKT_DATA_INBAND,
+                    VMBUS_DATA_PACKET_FLAG_COMPLETION_REQUESTED);
+        ... skip ...
+    }
+</div>
+vmbus_sendpacket() kernel API function has siblings vmbus_sendpacket_pagebuffer() and vmbus_sendpacket_mpb_desc() for sending large amounts of data to the hypervisor, vmbus_post_msg() for sending data directly via the Hyper-V IPC bypassing the VMBUS, and the respective vmbus_recvpacket() to fetch incoming data from the hypervisor. 
+
+From the caller's perspective, the only non-trivial abstraction that vmbus_sendpacket*() functions operate on, is a "channel". A channel is a logical VMBUS entity whose purpose is to uniquely identify data flows to and from a specific virtualized device. One channel per each virtualized device is created by the hypervisor, and provided to enlightened virtual machines as part of the channel offer during VMBUS initialization. In practice, channels are identified be small integer IDs, that are empirically persistent across boots.
+
+Aside from the VMBUS channel object, <a href="https://elixir.bootlin.com/linux/latest/source/drivers/hv/channel.c#L747">vmbus_sendpacket()</a> simply accepts from the caller a properly initialized data buffer that follows a channel-specific undocumented protocol, alongside with the request ID for book keeping purposes, and the request type:
+<div class = "code">
+    // channel.c 
+    int vmbus_sendpacket(struct vmbus_channel *channel, void *buffer,
+                u32 bufferlen, u64 requestid,
+                enum vmbus_packet_type type, u32 flags)
+    {
+        struct vmpacket_descriptor desc;
+        u32 packetlen = sizeof(struct vmpacket_descriptor) + bufferlen;
+        u32 packetlen_aligned = ALIGN(packetlen, sizeof(u64));
+        struct kvec bufferlist[3];
+        u64 aligned_data = 0;
+
+        /* Setup the descriptor */
+        desc.type = type; /* VmbusPacketTypeDataInBand; */
+        desc.flags = flags; /* VMBUS_DATA_PACKET_FLAG_COMPLETION_REQUESTED; */
+        /* in 8-bytes granularity */
+        desc.offset8 = sizeof(struct vmpacket_descriptor) >> 3;
+        desc.len8 = (u16)(packetlen_aligned >> 3);
+        desc.trans_id = requestid;
+
+        bufferlist[0].iov_base = &desc;
+        bufferlist[0].iov_len = sizeof(struct vmpacket_descriptor);
+        bufferlist[1].iov_base = buffer;
+        bufferlist[1].iov_len = bufferlen;
+        bufferlist[2].iov_base = &aligned_data;
+        bufferlist[2].iov_len = (packetlen_aligned - packetlen);
+
+        return hv_ringbuffer_write(channel, bufferlist, 3);
+    }
+    EXPORT_SYMBOL(vmbus_sendpacket);
+</div>
+The code of vmbus_sendpacket() procedure sets up a bufferlist with iovectors and a descriptor, and calls <a href="https://elixir.bootlin.com/linux/latest/source/drivers/hv/ring_buffer.c#L250">hv_ringbuffer_write()</a> to process it:
+<div class = "code">
+    // ring_buffer.c 
+    int hv_ringbuffer_write(struct vmbus_channel *channel,
+                const struct kvec *kv_list, u32 kv_count)
+    {
+        ... initialization ... 
+
+        bytes_avail_towrite = hv_get_bytes_to_write(outring_info);
+
+        ... sanity ...
+
+        /* Write to the ring buffer */
+        next_write_location = hv_get_next_write_location(outring_info);
+
+        old_write = next_write_location;
+
+        for (i = 0; i < kv_count; i++) {
+            next_write_location = hv_copyto_ringbuffer(outring_info,
+                                next_write_location,
+                                kv_list[i].iov_base,
+                                kv_list[i].iov_len);
+        }
+
+        /* Set previous packet start */
+        prev_indices = hv_get_ring_bufferindices(outring_info);
+
+        next_write_location = hv_copyto_ringbuffer(outring_info,
+                            next_write_location,
+                            &prev_indices,
+                            sizeof(u64));
+
+        ... memory barriers ...
+
+        hv_signal_on_write(old_write, channel);
+
+        ... done ...
+    }
+</div>
+As of the above code, on the guest side the VMBUS is implemented as a ring buffer. A <a href="https://en.wikipedia.org/wiki/Circular_buffer">ring buffer</a> is a common programming abstraction which is omnipresent in various shared memory implementations. One can notice separate ring buffers for outgoing and incoming data in LIS, one per each channel. The data is written to the ring buffer via call to <a href="https://elixir.bootlin.com/linux/latest/source/drivers/hv/ring_buffer.c#L114">hv_copyto_ringbuffer()</a>:
+<div class = "code">
+    // ring_buffer.c 
+    static u32 hv_copyto_ringbuffer(
+        struct hv_ring_buffer_info	*ring_info,
+        u32				start_write_offset,
+        const void			*src,
+        u32				srclen)
+    {
+        void *ring_buffer = hv_get_ring_buffer(ring_info);
+        u32 ring_buffer_size = hv_get_ring_buffersize(ring_info);
+
+        memcpy(ring_buffer + start_write_offset, src, srclen);
+
+        start_write_offset += srclen;
+        if (start_write_offset >= ring_buffer_size)
+            start_write_offset -= ring_buffer_size;
+    
+
+        return start_write_offset;
+    }
+</div>
+After the outgoing data is placed on the ring with a call to memcpy(), the VMBUS must be signalled for data availability with <a href="https://elixir.bootlin.com/linux/latest/source/drivers/hv/ring_buffer.c#L50">hv_signal_on_write()</a>, which in turn calls into <a href="https://elixir.bootlin.com/linux/latest/source/drivers/hv/channel.c#L44">vmbus_setevent()</a>:
+<div class = "code">
+    // ring_buffer.c 
+    static void hv_signal_on_write(u32 old_write, struct vmbus_channel *channel)
+    {
+        struct hv_ring_buffer_info *rbi = &channel->outbound;
+        mb();
+        if (READ_ONCE(rbi->ring_buffer->interrupt_mask))
+            return;
+
+        /* check interrupt_mask before read_index */
+        rmb();
+        /*
+        * This is the only case we need to signal when the
+        * ring transitions from being empty to non-empty.
+        */
+        if (old_write == READ_ONCE(rbi->ring_buffer->read_index)) {
+            ++channel->intr_out_empty;
+            vmbus_setevent(channel);
+        }
+    }
+
+    // channel.c 
+    void vmbus_setevent(struct vmbus_channel *channel)
+    {
+
+        ... initialization ...
+
+        if (channel->offermsg.monitor_allocated && !channel->low_latency) {
+            vmbus_send_interrupt(channel->offermsg.child_relid);
+
+            /* Get the child to parent monitor page */
+            monitorpage = vmbus_connection.monitor_pages[1];
+
+            sync_set_bit(channel->monitor_bit,
+                (unsigned long *)&monitorpage->trigger_group
+                        [channel->monitor_grp].pending);
+
+        } else {
+            vmbus_set_event(channel);
+        }
+    }
+    EXPORT_SYMBOL_GPL(vmbus_setevent);
+</div>
+The general logic of the above code is that a bit must be set in a shared memory page monitored by the hypervisor, in order to signal it about the incoming data. This is defined in section 11.7 Monitored Notifications of the TLFS. In some configurations, the monitor page mechanism is replaced with a notification hypercall in vmbus_set_event() (more on that later).
+
+Final piece of the puzzle is where the ring buffers originate from, and how the other side learns about their location. 
+
+Without unrolling layers of code, the answer is GPADL (Guest Physical Address Descriptor List). GPADL is an opaque data structure managed by the hypervisor, which enables the correspondence of guest memory addresses with the host or other partition memory space. 
+
+The algorithm is as follows: guest VM allocates kernel memory for the ring buffers, then requests a GPADL for the allocated memory region from the hypervisor, and finally, asks the hypervisor to map it as shared memory on the other side. On Windows this is done with opaque functions <a href="https://docs.microsoft.com/en-us/windows-hardware/drivers/ddi/vmbuskernelmodeclientlibapi/nc-vmbuskernelmodeclientlibapi-fn_vmb_channel_create_gpadl_from_buffer">[Fn]VmbChannelCreateGpadlFromBuffer()</a>  and <a href="https://docs.microsoft.com/en-us/windows-hardware/drivers/ddi/vmbuskernelmodeclientlibapi/nc-vmbuskernelmodeclientlibapi-fn_vmb_channel_map_gpadl">[Fn]VmbChannelMapGpadl()</a>, respectively.
+
+On Linux the same mechanism is a bit more transparent: <a href="https://elixir.bootlin.com/linux/latest/source/drivers/hv/channel.c#L439">vmbus_establish_gpadl()</a> procedure requests the GPADL handle for the supplied buffer by issuing a hypercall of type HVCALL_POST_MESSAGE (more on this in the section "<a href="#hypercalls">LIS Hypercalls</a>") with message type CHANNELMSG_GPADL_HEADER (undocumented):
+<div class = "code">
+    /*
+    * vmbus_establish_gpadl - Establish a GPADL for the specified buffer
+    *
+    * @channel: a channel
+    * @kbuffer: from kmalloc or vmalloc
+    * @size: page-size multiple
+    * @gpadl_handle: some funky thing
+    */
+    int vmbus_establish_gpadl(struct vmbus_channel *channel, void *kbuffer,
+                    u32 size, u32 *gpadl_handle)
+    {
+        struct vmbus_channel_gpadl_header *gpadlmsg;
+        struct vmbus_channel_gpadl_body *gpadl_body;
+        struct vmbus_channel_msginfo *msginfo = NULL;
+        struct vmbus_channel_msginfo *submsginfo, *tmp;
+     
+        ... initializations ...
+
+    	ret = create_gpadl_header(kbuffer, size, &msginfo);
+
+        gpadlmsg = (struct vmbus_channel_gpadl_header *)msginfo->msg;
+        gpadlmsg->header.msgtype = CHANNELMSG_GPADL_HEADER;
+        gpadlmsg->child_relid = channel->offermsg.child_relid;
+        gpadlmsg->gpadl = next_gpadl_handle;
+
+        ... spinlocks ...
+
+        ret = vmbus_post_msg(gpadlmsg, msginfo->msgsize -
+                    sizeof(*msginfo), true);
+
+        ... book keeping ...
+
+        /* At this point, we received the gpadl created msg */
+        *gpadl_handle = gpadlmsg->gpadl;
+
+        ... cleanup ...
+
+        kfree(msginfo);
+        return ret;
+    }
+    EXPORT_SYMBOL_GPL(vmbus_establish_gpadl);
+</div>
+Several channel message types then can accept the obtained GPADL handle, that will be mapped elsewhere transparently - primarily CHANNELMSG_OPENCHANNEL, a command to open a new VMBUS channel: 
+<div class = "code">
+    // channel.c: <a href="https://elixir.bootlin.com/linux/latest/source/drivers/hv/channel.c#L114">__vmbus_open()</a>
+	open_msg = (struct vmbus_channel_open_channel *)open_info->msg;
+	open_msg->header.msgtype = CHANNELMSG_OPENCHANNEL;
+	open_msg->openid = newchannel->offermsg.child_relid;
+	open_msg->child_relid = newchannel->offermsg.child_relid;
+	open_msg->ringbuffer_gpadlhandle = newchannel->ringbuffer_gpadlhandle;
+	open_msg->downstream_ringbuffer_pageoffset = newchannel->ringbuffer_send_offset;	
+	open_msg->target_vp = newchannel->target_vp;
+    ...
+    err = vmbus_post_msg(open_msg,
+        sizeof(struct vmbus_channel_open_channel), true);
+</div>
+Also, GPADL handle may be used in other special cases - e.g. channel message type NVSP_MSG1_TYPE_SEND_SEND_BUF, creating a shared memory buffer for networking purposes: 
+<div class = "code">
+    // netvsc.c: <a href="https://elixir.bootlin.com/linux/latest/source/drivers/net/hyperv/netvsc.c#L297">netvsc_init_buf()</a>
+	/* Notify the NetVsp of the gpadl handle */
+	init_packet = &net_device->channel_init_pkt;
+	memset(init_packet, 0, sizeof(struct nvsp_message));
+	init_packet->hdr.msg_type = NVSP_MSG1_TYPE_SEND_RECV_BUF;
+	init_packet->msg.v1_msg.send_recv_buf.
+		gpadl_handle = net_device->recv_buf_gpadl_handle;
+	init_packet->msg.v1_msg.
+		send_recv_buf.id = NETVSC_RECEIVE_BUFFER_ID;
+</div>
+The whole logic of ring buffer establishment may be observed via vmbus_open() procedure code, the core function that implements the many actions required to accept a VMBUS channel offer and open the channel, with ring buffer allocations done in hv_ringbuffer_init(), and the mapping completed with vmbus_establish_gpadl() and vmbus_post_msg(). 
+
+That's it. The VMBUS operates largely intependently from the hypercall interface, via shared memory and passive interrupts with a monitor page. The hypercall interface is initially utilized to establish the VMBUS connection and interfaces, and later to tear it down.
+
+Now let's look at the actual hypercall interface. 
+
+
+<a name="hypercalls"><h2>LIS Hypercalls</h2></a>
+In general, a hypercall may be defined as a software interface from the guest VM to the hypervisor. In technical implementation practice, however, that can mean anything, from a simple PIO trap with a magic value (as in VMWare Workstation backdoor), to a special CPU instruction with hardware support (Intel VT-x / AMD-V). In modern virtualization practice the latter is de-facto standard, as it enables a simpler implemenation with better performance characteristics.
+
+In Hyper-V design theory, the hypercall interface is functionally defined in TLFS section 3: Hypercall Interface. [TLFS]  The specification however omits any technical details regarding the implementation. We can investigate the technical details by either reverse-engineering Hyper-V modules and API on Windows (nt!HvcallCodeVa and friends), or look into the open-source modules of LIS. 
+
+In LIS the hypercall interface is represented with a low-level hv_do_* family of functions, defined in mshyperv.h, and the high-level specializations hv_post_message() and vmbus_post_msg(), that implement the Hyper-V IPC. Note that the latter name is misguiding, as vmbus_post_msg() has nothing to do with the VMBUS itself (the shared memory buffer), but simply wraps an asynchronous hypercall. 
+
+The Hyper-V IPC (Inter-Partition Communication) is a subset of the hypercall interface, represented with two functions: one that sends an asynchronous message to the hypervisor (HvPostMessage), and one that sends a notification (HvSignalEvent). IPC is defined in TLFS section 11.11 Inter-Partition Communication Interfaces. In practice, the IPC is implemented as a generic hypercall with a specific call code provided in the registers:
+<div class = "code">
+    // asm/hyperv.h 
+    #define HVCALL_POST_MESSAGE			0x005c
+    #define HVCALL_SIGNAL_EVENT			0x005d
+</div>
+The hv_post_message() procedure is a direct implementation of the HvPostMessage hypercall specification defined in TLFS 11.11.1 as follows: 
+<div class = "code">
+    11.11.1 HvPostMessage
+    The HvPostMessage hypercall attempts to post (that is, send 
+    asynchronously) a message to the specified connection, which 
+    has an associated destination port.
+    
+    HV_STATUS
+    HvPostMessage(
+        __in HV_CONNECTION_ID ConnectionId, 
+        __in HV_MESSAGE_TYPE MessageType,
+        __in UINT32 PayloadSize, 
+        __in_ecount(PayloadSize)
+        PCVOID Message
+        );
+    
+    Call Code = 0x005C // HVCALL_POST_MESSAGE
+</div>
+The code of <a href="https://elixir.bootlin.com/linux/latest/source/drivers/hv/hv.c#L44">hv_post_message()</a> procedure simply aligns the supplied buffer and forwards it to one of the low-level interfaces mentioned previously, hv_do_hypercall:
+<div class = "code">
+    // hv.c 
+    int hv_post_message(union hv_connection_id connection_id,
+            enum hv_message_type message_type,
+            void *payload, size_t payload_size)
+    {
+        struct hv_input_post_message *aligned_msg;
+        struct hv_per_cpu_context *hv_cpu;
+        u64 status;
+
+        if (payload_size > HV_MESSAGE_PAYLOAD_BYTE_COUNT)
+            return -EMSGSIZE;
+
+        hv_cpu = get_cpu_ptr(hv_context.cpu_context);
+        aligned_msg = hv_cpu->post_msg_page;
+        aligned_msg->connectionid = connection_id;
+        aligned_msg->reserved = 0;
+        aligned_msg->message_type = message_type;
+        aligned_msg->payload_size = payload_size;
+        memcpy((void *)aligned_msg->payload, payload, payload_size);
+
+        status = hv_do_hypercall(HVCALL_POST_MESSAGE, aligned_msg, NULL);
+        
+        /* Preemption must remain disabled until after the hypercall
+        * so some other thread can't get scheduled onto this cpu and
+        * corrupt the per-cpu post_msg_page
+        */
+        put_cpu_ptr(hv_cpu);
+
+        return status & 0xFFFF;
+    }
+</div>
+hv_do_* family of functions implements the low-level hypercall interface. It is represented with three varieties: 
+hv_do_hypercall - the main implementation; 
+hv_do_fast_hypercall8 - fast hypercall with 8 bytes of input and no output;
+hv_do_rep_hypercall - repeated hypercall with rep_count.
+
+The core of hv_do_* procedures rolls down to a short <a href="https://gcc.gnu.org/onlinedocs/gcc/Extended-Asm.html">Extended Asm</a> specifier: 
+<div class = "code">
+    // mshyperv.h: <a href="https://elixir.bootlin.com/linux/latest/source/arch/x86/include/asm/mshyperv.h#L74">hv_do_hypercall()</a>
+    ...
+	__asm__ __volatile__("mov %4, %%r8\n"
+			     "call *%5"
+                            : "=a" (hv_status), ASM_CALL_CONSTRAINT,
+			       "+c" (control), "+d" (input_address)
+			     :  "r" (output_address), "m" (hv_hypercall_pg)
+			     : "cc", "memory", "r8", "r9", "r10", "r11");
+</div>
+Above code calls into the hypercall page - a special region of memory which is allocated on the guest initialization and then sent to the hypervisor via a write to the <a href="https://en.wikipedia.org/wiki/Model-specific_register">MSR register</a> 0x40000001 (HV_X64_MSR_HYPERCALL):
+<div class = "code">
+    // hv_init.c: <a href="https://elixir.bootlin.com/linux/latest/source/arch/x86/hyperv/hv_init.c#L312">hyperv_init()</a>
+	hv_hypercall_pg  = __vmalloc(PAGE_SIZE, GFP_KERNEL, PAGE_KERNEL_RX);
+	if (hv_hypercall_pg == NULL) {
+		wrmsrl(HV_X64_MSR_GUEST_OS_ID, 0);
+		goto free_vp_index;
+	}
+
+	rdmsrl(HV_X64_MSR_HYPERCALL, hypercall_msr.as_uint64);
+	hypercall_msr.enable = 1;
+	hypercall_msr.guest_physical_address = vmalloc_to_pfn(hv_hypercall_pg);
+	wrmsrl(HV_X64_MSR_HYPERCALL, hypercall_msr.as_uint64);
+
+    // mshyperv.h 
+    #define HV_X64_MSR_HYPERCALL	0x40000001
+
+    union hv_x64_msr_hypercall_contents {
+        u64 as_uint64;
+        struct {
+            u64 enable:1;
+            u64 reserved:11;
+            u64 guest_physical_address:52;
+        };
+    };
+</div>
+The hypervisor then provides the actual binary code of the hypercall procedure by populating the contents of the hypercall page with architecture-specific CPU instructions. On Intel processor it's comes down to a vmcall instruction. [INTELVTX]
+
+The hypercall interface is used sparingly in LIS, with most of the work done via VMBUS. Specifically hypercalls are used in two scenarios: 
+
+1) Initial setting up of the VMBUS interface.
+This is done via an hypercall with HVCALL_POST_MESSAGE call code - hv_post_message() discussed above [TLFS 11.11.1]. 
+
+2) The hypervisor notification mechanism [TLFS 11.11.2], alternative to the monitor page [TLFS 11.7]. 
+This is done via an hypercall with HVCALL_SIGNAL_EVENT call code; implementation is in vmbus_set_event(). 
+
+<div class = "code">
+    // channel.c: <a href="https://elixir.bootlin.com/linux/latest/source/drivers/hv/channel.c#L44">vmbus_setevent()</a>
+    /*
+    * For channels marked as in "low latency" mode
+    * bypass the monitor page mechanism.
+    */
+    if (channel->offermsg.monitor_allocated && !channel->low_latency) {
+        vmbus_send_interrupt(channel->offermsg.child_relid);
+
+        /* Get the child to parent monitor page */
+        monitorpage = vmbus_connection.monitor_pages[1];
+
+        sync_set_bit(channel->monitor_bit,
+            (unsigned long *)&monitorpage->trigger_group
+                    [channel->monitor_grp].pending);
+
+    } else {
+        vmbus_set_event(channel);
+    }
+</div>
+
+As of the above code, which notification mechanism would be used is defined by the hypervisor inside the channel offer. 
+
+
+<a name="conclusions"><h2>Conclusions</h2></a>
+Hyper-V relies on two core mechanisms for inter-partition and hypervisor communications: the hypercall interface and the VMBUS. This note constitutes a fairly complete and technically concise overview of an implementation of both at the core level. 
+
+Despite the focus on Linux internals, the general implementation principles discussed here are expected to be largely relevant to Windows VM implementations. 
+
+The undocumented internals of channel-specific hypervisor protocols that format the data sent over the VMBUS are omitted from this note. 
+
+With respect to my upcoming article about Hyper-V CVE-2018-0717, LIS constitutes the platform that I selected for rapid prototyping of the vulnerability. Specifically, the <a href="https://github.com/badd1e/Disclosures/blob/master/CVE-2019-0717_Hyper-V/PoC_CVE-2019-0717.c">proof-of-concept snippet</a> must be invoked from within rndis_filter.c in order to reproduce the bug. 
+
+LIS is essential for runtime introspection of the hypervisor and VMBUS internals for Hyper-V security research, and makes it easier than with an equivalent Windows-based implementation. 
+
+Almost any vulnerability in the Microsoft Hyper-V can be prototyped with LIS, with the exception of Windows-specific guest attack vectors, such as the Enhanced Session mode backend. 
+
+
+<a name="references"><h2>References</h2></a>
+[LIS] Linux Integration Services v4.3 for Hyper-V and Azure 
+<a href="https://www.microsoft.com/en-us/download/details.aspx?id=55106">https://www.microsoft.com/en-us/download/details.aspx?id=55106</a>
+[TLFS] Hyper-V Hypervisor Top Level Functional Specification 
+<a href="https://docs.microsoft.com/en-us/virtualization/hyper-v-on-windows/reference/tlfs">https://docs.microsoft.com/en-us/virtualization/hyper-v-on-windows/reference/tlfs</a>
+[HVARCH] Hyper-V Architecture 
+<a href="https://docs.microsoft.com/en-us/virtualization/hyper-v-on-windows/reference/hyper-v-architecture">https://docs.microsoft.com/en-us/virtualization/hyper-v-on-windows/reference/hyper-v-architecture</a>
+[INTELVTX] Intel® 64 and IA-32 Architectures Software Developer’s Manual, Volume 3C, Chapter 30, "VMX Instruction Reference"
+<a href="https://software.intel.com/content/www/us/en/develop/articles/intel-sdm.html#combined">https://software.intel.com/content/www/us/en/develop/articles/intel-sdm.html#combined</a>
+
+        </div>
+
+
+        ️️<div class = "meta">
+❤️ Written and published by <a href="https://alisa.sh">Alisa Esage Шевченко</a> on 14 May 2020
+        </div>
+
+        <div class = "footer">
+Copying and redistribution of this Research Note is permitted for non-commercial purposes only, as long as the text is kept intact, and contains a reference to the original URL, the author's contacts, and the present copyright notice. Commercial usage of this Research Note without the author's explicit written permission is prohibited.
+        </div>
+
+    </body>
+</html>
