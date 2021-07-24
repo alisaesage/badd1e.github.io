@@ -57,3 +57,7 @@ div.index {
     width: 300px;
     text-align: center;
 }
+.metanote {
+    font-size: 10;
+    font-style: italic;
+}
